@@ -2,61 +2,60 @@
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq;
+using System.Threading;
 using System.Threading.Tasks;
-using Microsoft.Azure;
 using Microsoft.WindowsAzure.Storage;
 using Microsoft.WindowsAzure.Storage.Blob;
 using Microsoft.WindowsAzure.Storage.Table;
 
-namespace AzureTableAndBlobCopier
+namespace AzureDataMigrator
 {
     public class StorageAccountMigrator
     {
-        private readonly CloudStorageAccount sourceAccount;
-        private readonly CloudStorageAccount targetAccount;
+        private CloudStorageAccount sourceAccount;
+        private CloudStorageAccount targetAccount;
+        private bool migrateTables;
+        private bool migrateBlobs;
 
-        public StorageAccountMigrator()
+        public Task<string> StartAsync(string sourceConnection, string targetConnection, bool doTableMigration, bool doBlobMigration)
         {
-            var sourceCs = CloudConfigurationManager.GetSetting("source");
-            sourceAccount = CloudStorageAccount.Parse(sourceCs);
-
-            var targetCs = CloudConfigurationManager.GetSetting("target");
-            targetAccount = CloudStorageAccount.Parse(targetCs);
+            sourceAccount = CloudStorageAccount.Parse(sourceConnection);
+            targetAccount = CloudStorageAccount.Parse(targetConnection);
+            migrateTables = doTableMigration;
+            migrateBlobs = doBlobMigration;
+            return ExecuteMigrationAsync();
         }
 
-        public async Task<string> Start()
+        private async Task<string> ExecuteMigrationAsync()
         {
-            return await Task.Run(() => ExecuteMigration());
-        }
+            //await DeleteExistingTargetDataAsync();
 
-        private string ExecuteMigration()
-        {
-            var migrateBlobs = CloudConfigurationManager
-                                    .GetSetting("MigrateBlobs") == "true";
+            //MSDN says the table will take about 40 seconds to delete.  Trying to access it before that time will cause a 409 (conflict) to be returned.
+            //so, wait about a minute before proceeding.  MSDN article: https://msdn.microsoft.com/library/azure/dd179387.aspx
+            //await Task.Delay(TimeSpan.FromMinutes(1));  
 
-            var migrateTables = CloudConfigurationManager
-                                    .GetSetting("MigrateTables") == "true";
-            var tasks = new[]
-                    {
-                    migrateBlobs
-                        ? MigrateBlobContainers()
-                        : Task.Run(() => { }),
-                    migrateTables
-                        ? MigrateTableStorage()
-                        : Task.Run(() => { }),
-                };
-
-            Task.WaitAll(tasks);
+            if (migrateBlobs) MigrateBlobContainers().Wait();
+            if (migrateTables) MigrateTableStorage();
             return "done";
         }
 
-        private Task MigrateTableStorage()
+        private async Task DeleteExistingTargetDataAsync()
         {
-            return Task.Run(() =>
-            {
-                CopyTableStorageFromSource();
-                return "done";
-            });
+            Console.WriteLine("Deleting data from target storage...");
+            var tableClient = targetAccount.CreateCloudTableClient();
+            var tables = tableClient.ListTables();
+            var tasks = tables.Select(x => x.DeleteIfExistsAsync());
+            await Task.WhenAll(tasks);
+
+            var blobClient = targetAccount.CreateCloudBlobClient();
+            var containers = blobClient.ListContainers();
+            tasks = containers.Select(x => x.DeleteIfExistsAsync());
+            await Task.WhenAll(tasks);
+        }
+
+        private void MigrateTableStorage()
+        {
+            CopyTableStorageFromSource();
         }
 
         private void CopyTableStorageFromSource()
@@ -64,8 +63,8 @@ namespace AzureTableAndBlobCopier
             var source = sourceAccount.CreateCloudTableClient();
 
             var cloudTables = source.ListTables()
-                .OrderBy(c => c.Name)
-                .ToList();
+            .OrderBy(c => c.Name)
+            .ToList();
 
             foreach (var table in cloudTables)
                 CopyTables(table);
@@ -74,26 +73,13 @@ namespace AzureTableAndBlobCopier
         private void CopyTables(CloudTable table)
         {
             var target = targetAccount.CreateCloudTableClient();
-
             var targetTable = target.GetTableReference(table.Name);
-
             targetTable.CreateIfNotExists();
-
             targetTable.SetPermissions(table.GetPermissions());
-
-            Console.WriteLine("Created Table Storage :" + table.Name);
-
-            var omit = CloudConfigurationManager
-                .GetSetting("TablesToCreateButNotMigrate")
-                .Split(new[] { "|" }, StringSplitOptions.RemoveEmptyEntries);
-
-            if (!omit.Contains(table.Name))
-                CopyData(table);
+            Console.WriteLine("Created Storage Table:" + table.Name);
+            CopyData(table);
         }
-
-        readonly List<ICancellableAsyncResult> queries
-            = new List<ICancellableAsyncResult>();
-
+        
         readonly Dictionary<string, long> retrieved
             = new Dictionary<string, long>();
 
@@ -102,57 +88,33 @@ namespace AzureTableAndBlobCopier
 
         private void CopyData(CloudTable table)
         {
-            ExecuteQuerySegment(table, null);
-        }
-
-        private void ExecuteQuerySegment(CloudTable table,
-                                            TableContinuationToken token)
-        {
-            var reqOptions = new TableRequestOptions();
-
+            TableContinuationToken token = null;
+            TableRequestOptions reqOptions = new TableRequestOptions();
             var ctx = new OperationContext { ClientRequestID = "StorageMigrator" };
-
-            queries.Add(table.BeginExecuteQuerySegmented(query,
-                                                            token,
-                                                            reqOptions,
-                                                            ctx,
-                                                            HandleCompletedQuery(),
-                                                            table));
-        }
-
-        private AsyncCallback HandleCompletedQuery()
-        {
-            return ar =>
+            while (true)
             {
-                var cloudTable = ar.AsyncState as CloudTable;
-                if (cloudTable == null) return;
-
-                var response = cloudTable
-                                .EndExecuteQuerySegmented<DynamicTableEntity>(ar);
-                var token = response.ContinuationToken;
-
-                if (token != null)
-                    Task.Run(() => ExecuteQuerySegment(cloudTable, token));
-
-                var retrieved = response.Count();
-
-                if (retrieved > 0)
-                    Task.Run(() => WriteToTarget(cloudTable, response));
-
-
-                var recordsRetrieved = retrieved;
-
-                UpdateCount(cloudTable, recordsRetrieved);
-
-                Console.WriteLine("Table " +
+                ManualResetEvent evt = new ManualResetEvent(false);
+                var result = table.BeginExecuteQuerySegmented(query, token, reqOptions, ctx, (o) =>
+                {
+                    var cloudTable = o.AsyncState as CloudTable;
+                    var response = cloudTable.EndExecuteQuerySegmented<DynamicTableEntity>(o);
+                    token = response.ContinuationToken;
+                    var retrieved = response.Count();
+                    if (retrieved > 0) WriteToTarget(cloudTable, response);
+                    UpdateCount(cloudTable, retrieved);
+                    Console.WriteLine("Table " +
                                     cloudTable.Name +
                                     " |> Records = " +
-                                    recordsRetrieved +
+                                    retrieved +
                                     " | Total Records = " +
                                     this.retrieved[cloudTable.Name]);
-            };
+                    evt.Set();
+                }, table);
+                evt.WaitOne();
+                if (token == null) break;
+            }
         }
-
+        
         private void UpdateCount(CloudTable cloudTable, int recordsRetrieved)
         {
             if (!retrieved.ContainsKey(cloudTable.Name))
@@ -161,10 +123,10 @@ namespace AzureTableAndBlobCopier
                 retrieved[cloudTable.Name] += recordsRetrieved;
         }
 
-        private static void WriteToTarget(CloudTable cloudTable,
+        private void WriteToTarget(CloudTable cloudTable,
                                             IEnumerable<DynamicTableEntity> response)
         {
-            var writer = new TableStorageWriter(cloudTable.Name);
+            var writer = new TableStorageWriter(cloudTable.Name, targetAccount);
             foreach (var entity in response)
             {
                 writer.InsertOrReplace(entity);

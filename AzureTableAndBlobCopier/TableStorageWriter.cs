@@ -2,14 +2,11 @@
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Linq;
-using System.Text;
-using System.Threading.Tasks;
-using Microsoft.Azure;
 using Microsoft.WindowsAzure.Storage;
 using Microsoft.WindowsAzure.Storage.RetryPolicies;
 using Microsoft.WindowsAzure.Storage.Table;
 
-namespace AzureTableAndBlobCopier
+namespace AzureDataMigrator
 {
     public class TableStorageWriter
     {
@@ -18,13 +15,11 @@ namespace AzureTableAndBlobCopier
         private readonly CloudStorageAccount storageAccount;
         private readonly string tableName;
 
-        public TableStorageWriter(string tableName)
+        public TableStorageWriter(string tableName, CloudStorageAccount target)
         {
             this.tableName = tableName;
 
-            var cs = CloudConfigurationManager.GetSetting("target");
-
-            storageAccount = CloudStorageAccount.Parse(cs);
+            storageAccount = target;
 
             var tableReference = MakeTableReference();
 
@@ -147,7 +142,7 @@ namespace AzureTableAndBlobCopier
             return new TableRequestOptions
             {
                 RetryPolicy = new ExponentialRetry(TimeSpan.FromMilliseconds(2),
-                                                       100)
+                                                   100)
             };
         }
 
