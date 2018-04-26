@@ -16,13 +16,15 @@ namespace AzureDataMigrator
         private CloudStorageAccount targetAccount;
         private bool migrateTables;
         private bool migrateBlobs;
+        private string tableList;
 
-        public Task<string> StartAsync(string sourceConnection, string targetConnection, bool doTableMigration, bool doBlobMigration)
+        public Task<string> StartAsync(string sourceConnection, string targetConnection, bool doTableMigration, bool doBlobMigration, string tableList)
         {
             sourceAccount = CloudStorageAccount.Parse(sourceConnection);
             targetAccount = CloudStorageAccount.Parse(targetConnection);
             migrateTables = doTableMigration;
             migrateBlobs = doBlobMigration;
+            this.tableList = tableList;
             return ExecuteMigrationAsync();
         }
 
@@ -64,9 +66,16 @@ namespace AzureDataMigrator
 
             var cloudTables = source.ListTables()
             .OrderBy(c => c.Name)
-            .ToList();
+            .ToArray();
 
-            foreach (var table in cloudTables)
+            var toCopyCloudTables = cloudTables;
+            if (!string.IsNullOrEmpty(tableList))
+            {
+                var tableListArray = tableList.Split(',');
+                toCopyCloudTables = cloudTables.Where(table => tableListArray.Contains(table.Name)).ToArray();
+            }
+
+            foreach (var table in toCopyCloudTables)
                 CopyTables(table);
         }
 

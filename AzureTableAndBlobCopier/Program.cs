@@ -22,10 +22,15 @@ namespace AzureTableAndBlobCopier
             var migrateTables = args[2].ToLower() == "true";
             var migrateBlobs = args[3].ToLower() == "true";
 
+            var tableList = string.Empty;
+            if (args.Length > 4)
+                tableList = args[4];
+        
+
             var storageAccountMigrator = new StorageAccountMigrator();
             Task.Run(async () =>
             {
-                await storageAccountMigrator.StartAsync(sourceConnectionString, targetConnectionString, migrateTables, migrateBlobs);
+                await storageAccountMigrator.StartAsync(sourceConnectionString, targetConnectionString, migrateTables, migrateBlobs, tableList);
             }).Wait();
         }
     }
